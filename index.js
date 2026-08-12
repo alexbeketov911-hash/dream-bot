@@ -41,7 +41,7 @@ const FORBIDDEN_PATTERNS = [
   /you are now an astrologer/i,
 ];
 
-// ---- Проверка: уже был разбор или первый сон (прямой SQL — надёжнее) ----
+// ---- Проверка: уже был разбор или первый сон ----
 function hasAssistantReplied(userId) {
   try {
     const row = db.prepare('SELECT COUNT(*) as count FROM messages WHERE telegram_id = ? AND role = ?').get(userId, 'assistant');
@@ -72,7 +72,6 @@ function getMenuInline(userId) {
     ]);
   } catch (e) {
     log('error', 'getMenuInline failed', { userId, error: e.message });
-    // Fallback — базовое меню, чтобы бот не падал
     return Markup.inlineKeyboard([
       [Markup.button.callback('🌙 Рассказать сон', 'tell_dream')],
       [Markup.button.callback('🗑 Очистить историю', 'clear_history')],
@@ -204,6 +203,45 @@ bot.command('stop', async (ctx) => {
   process.exit(0);
 });
 
+// ---- /sessions — только для админа ----
+bot.command('sessions', async (ctx) => {
+  if (!ADMIN_ID || ctx.from.id !== ADMIN_ID) {
+    return ctx.reply('Эта команда только для администратора.', getMenuInline(ctx.from.id));
+  }
+
+  try {
+    const rows = db.prepare(`
+      SELECT u.telegram_id, COUNT(m.id) as msg_count, MAX(m.created_at) as last_active
+      FROM users u
+      LEFT JOIN messages m ON m.telegram_id = u.telegram_id
+      GROUP BY u.telegram_id
+      ORDER BY last_active DESC
+    `).all();
+
+    if (rows.length === 0) {
+      return ctx.reply('📊 Пока нет пользователей.', getMenuInline(ctx.from.id));
+    }
+
+    let text = '📊 Статистика пользователей\n\n';
+    const buttons = [];
+
+    for (const row of rows) {
+      const id = row.telegram_id;
+      const count = row.msg_count;
+      const last = row.last_active || '—';
+      text += `👤 ID: ${id}\n   Сообщений: ${count}\n   Активность: ${last}\n\n`;
+      buttons.push([Markup.button.callback(`👤 ${id} (${count})`, `view_session_${id}`)]);
+    }
+
+    buttons.push([Markup.button.callback('← Назад в меню', 'back_menu')]);
+
+    await ctx.reply(text, Markup.inlineKeyboard(buttons));
+  } catch (e) {
+    log('error', '/sessions error', { error: e.message });
+    await ctx.reply('Ошибка при получении статистики.', getMenuInline(ctx.from.id));
+  }
+});
+
 // ===== INLINE-КНОПКИ =====
 
 bot.action('tell_dream', async (ctx) => {
@@ -242,6 +280,39 @@ bot.action('example', async (ctx) => {
 bot.action('back_menu', async (ctx) => {
   await ctx.answerCbQuery();
   await ctx.reply(START_TEXT, getMenuInline(ctx.from.id));
+});
+
+// ---- Просмотр переписки конкретного пользователя (только админ) ----
+bot.action(/view_session_(\d+)/, async (ctx) => {
+  if (!ADMIN_ID || ctx.from.id !== ADMIN_ID) {
+    await ctx.answerCbQuery('Нет доступа');
+    return;
+  }
+
+  const targetId = Number(ctx.match[1]);
+  await ctx.answerCbQuery();
+
+  try {
+    const messages = db.prepare(
+      'SELECT role, content, created_at FROM messages WHERE telegram_id = ? ORDER BY id ASC'
+    ).all(targetId);
+
+    if (messages.length === 0) {
+      return ctx.reply('Сообщений не найдено.', backInline);
+    }
+
+    let text = `📋 Переписка с ${targetId}:\n\n`;
+    for (const m of messages) {
+      const who = m.role === 'user' ? '👤' : '🤖';
+      text += `${who} [${m.created_at}]\n${m.content}\n\n`;
+      if (text.length > 3500) break; // не превышаем лимит
+    }
+
+    await ctx.reply(text.slice(0, 4000), backInline);
+  } catch (e) {
+    log('error', 'view_session error', { targetId, error: e.message });
+    await ctx.reply('Ошибка при загрузке переписки.', backInline);
+  }
 });
 
 // ===== ОСНОВНОЙ ОБРАБОТЧИК ТЕКСТА =====

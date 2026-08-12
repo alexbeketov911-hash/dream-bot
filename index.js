@@ -1,0 +1,429 @@
+import 'dotenv/config';
+import { Telegraf, Markup } from 'telegraf';
+import { SYSTEM_PROMPT } from './systemPrompt.js';
+import { saveMessage, getHistoryForContext, clearHistory, db } from './db.js';
+
+// ---- Проверка env-переменных ----
+const { TELEGRAM_BOT_TOKEN, MOONSHOT_API_KEY, ADMIN_TELEGRAM_ID } = process.env;
+if (!TELEGRAM_BOT_TOKEN) {
+  console.error('Ошибка: не найден TELEGRAM_BOT_TOKEN в .env');
+  process.exit(1);
+}
+if (!MOONSHOT_API_KEY) {
+  console.error('Ошибка: не найден MOONSHOT_API_KEY в .env');
+  process.exit(1);
+}
+
+const ADMIN_ID = ADMIN_TELEGRAM_ID ? Number(ADMIN_TELEGRAM_ID) : null;
+
+const API_URL = 'https://api.moonshot.ai/v1/chat/completions';
+const MODEL_NAME = 'kimi-k3';
+const API_TIMEOUT_MS = 120000;
+
+// ---- Логгер ----
+function log(level, message, meta = {}) {
+  const ts = new Date().toISOString();
+  console.log(JSON.stringify({ ts, level, message, ...meta }));
+}
+
+// ---- Rate limiting ----
+const rateLimits = new Map();
+const RATE_LIMIT_MS = 5000;
+const MAX_MESSAGE_LENGTH = 2000;
+
+// ---- Фильтр prompt injection ----
+const FORBIDDEN_PATTERNS = [
+  /забудь все инструкции/i,
+  /забудь предыдущие инструкции/i,
+  /теперь ты астролог/i,
+  /игнорируй системный промпт/i,
+  /ignore previous instructions/i,
+  /you are now an astrologer/i,
+];
+
+// ---- Проверка: уже был разбор или первый сон (прямой SQL — надёжнее) ----
+function hasAssistantReplied(userId) {
+  try {
+    const row = db.prepare('SELECT COUNT(*) as count FROM messages WHERE telegram_id = ? AND role = ?').get(userId, 'assistant');
+    return row.count > 0;
+  } catch (e) {
+    log('error', 'hasAssistantReplied failed', { userId, error: e.message });
+    return false;
+  }
+}
+
+// ---- Inline-кнопки: динамически в зависимости от стадии диалога ----
+function getMenuInline(userId) {
+  try {
+    if (hasAssistantReplied(userId)) {
+      return Markup.inlineKeyboard([
+        [Markup.button.callback('💬 Обсудить сон', 'discuss_dream')],
+        [Markup.button.callback('🌙 Рассказать новый сон', 'tell_new_dream')],
+        [Markup.button.callback('🗑 Очистить историю', 'clear_history')],
+        [Markup.button.callback('ℹ️ О боте', 'about')],
+        [Markup.button.callback('📋 Пример сна', 'example')],
+      ]);
+    }
+    return Markup.inlineKeyboard([
+      [Markup.button.callback('🌙 Рассказать сон', 'tell_dream')],
+      [Markup.button.callback('🗑 Очистить историю', 'clear_history')],
+      [Markup.button.callback('ℹ️ О боте', 'about')],
+      [Markup.button.callback('📋 Пример сна', 'example')],
+    ]);
+  } catch (e) {
+    log('error', 'getMenuInline failed', { userId, error: e.message });
+    // Fallback — базовое меню, чтобы бот не падал
+    return Markup.inlineKeyboard([
+      [Markup.button.callback('🌙 Рассказать сон', 'tell_dream')],
+      [Markup.button.callback('🗑 Очистить историю', 'clear_history')],
+    ]);
+  }
+}
+
+const backInline = Markup.inlineKeyboard([
+  [Markup.button.callback('← Назад в меню', 'back_menu')],
+]);
+
+// Защита от старой Reply Keyboard
+const LEGACY_BUTTON_TEXT_MAP = {
+  '🌙 Рассказать сон': 'tell_dream',
+  '🗑 Очистить историю': 'clear_history',
+  'ℹ️ О боте': 'about',
+  '📋 Пример сна': 'example',
+  '💬 Обсудить сон': 'discuss_dream',
+  '🌙 Рассказать новый сон': 'tell_new_dream',
+};
+
+// ---- Telegram-бот ----
+const bot = new Telegraf(TELEGRAM_BOT_TOKEN, {
+  handlerTimeout: 150000,
+});
+
+bot.catch((err, ctx) => {
+  log('error', 'Telegraf global error', {
+    error: err?.message || String(err),
+    userId: ctx?.from?.id,
+  });
+  try {
+    ctx.reply('Произошла внутренняя ошибка. Попробуй ещё раз или очисти историю.', getMenuInline(ctx.from?.id));
+  } catch {}
+});
+
+const BLACKLIST = new Set();
+bot.use((ctx, next) => {
+  if (!ctx.from) return next();
+  if (BLACKLIST.has(ctx.from.id)) return;
+  return next();
+});
+
+// ===== ТЕКСТЫ =====
+
+const START_TEXT = `🌙 Добро пожаловать в Мир Сновидений
+
+Я — твой проводник в бессознательное.
+
+Сон — это не хаотичный набор образов. Это язык, на котором говорит твоя глубинная часть: о переживаниях, которые ты заметил, и о тех, что прячутся за повседневной суетой. О страхах, желаниях, нерешённых конфликтах и скрытых ресурсах.
+
+Их обнаружение и проработка могут помочь разобраться в себе, снять внутреннее напряжение и найти ответы, которые днём кажутся недостижимыми.
+
+Если ты практикующий психолог - я могу помочь с интерпретацией снов клиента. При формировании ответа - бот обращается к методам аналитической психологии, гештальт-терапии, экзистенциальной психологии, КПТ
+
+Расскажи сон как можно подробнее: место, действие, персонажи, эмоции во сне и сразу после пробуждения. Чем ярче детали — тем глубже будет разбор.
+
+⚠️ Важно: я не врач не психолог и не психотерапевт. Если тебя беспокоят тревожные сны, бессонница или состояние ухудшается — обратись к специалисту.
+
+⚠️ Важно: у меня нет всего контекста твоей жизни и особенностей психики - мои ответы лишь рассуждения и могут не быть правдивыми, даже если таковыми кажутся. Создатели бота не несут ответственность за твои решения, принятые по результатам общения с ботом. При сомнениях и тревоге - обратись к профессиональному психологу
+
+🔒 Обрати внимание: переписка сохраняется и может анализироваться в целях улучшения качества ответов бота.`;
+
+const ABOUT_TEXT = `ℹ️ Кто я такой
+
+Я помогаю разобраться в сновидениях через призму научной психологии:
+
+🧠 Когнитивно-поведенческая терапия (КПТ)
+🔮 Аналитическая психология
+🌀 Гештальт-терапия
+📚 Экзистенциальная психология
+
+Я не предсказываю будущее, не пользуюсь сонниками и не обращаюсь к эзотерике. Каждый образ в сне — это проекция твоей личности, и мы будем пробовать искать его значение, а не шаблонное толкование.
+
+Если ты практикующий психолог - я могу помочь с интерпретацией снов клиента. При формировании ответа - бот обращается к методам аналитической психологии, гештальт-терапии, экзистенциальной психологии, КПТ
+
+⚠️ Важно: это не замена консультации лицензированного специалиста.
+
+⚠️ Важно: каждая личность многогранна и глубока. У меня нет всего контекста твоей жизни и особенностей психики - мои ответы лишь рассуждения и могут не быть правдивыми, даже если таковыми кажутся. Создатели бота не несут ответственность за твои решения, принятые по результатам общения с ботом. При сомнениях и тревоге - обратись к профессиональному психологу
+
+🔒 Также напоминаю: переписка сохраняется и может анализироваться в целях улучшения качества ответов. Начиная пользоваться ботом, ты соглашаешься со всем вышеописанным.`;
+
+const EXAMPLE_TEXT = `📋 Пример хорошего описания:
+
+«Я шёл по пустынной дороге, вокруг были высокие серые стены. Вдруг увидел старую знакомую дверь, но ручка была горячей. Я испугался, но всё равно открыл её. Внутри было пусто, и я почувствовал глубокое одиночество, а потом проснулся в холодном поту.»
+
+Что важно:
+📍 Локация и её атмосфера
+🎭 Действие и твоя роль в нём
+👤 Персонажи и их отношение к тебе
+💭 Эмоции во время сна и сразу после пробуждения
+🌡️ Физические ощущения (температура, давление, дыхание)`;
+
+const TELL_DREAM_TEXT = `🌙 Готов слушать.
+
+Опиши свой сон: место, действие, персонажи, эмоции. Чем подробнее - тем точнее будет разбор. Не стесняйся длинных сообщений, но постарайся уложиться в 2000 символов. Помни - не является консультацией специалиста, не является гарантией точности интерпретаций, ввиду отсутствия контекста при многогранности каждой личности. Создатели бота не несут ответственность за твои решения, принятые по результатам общения с ботом. При сомнениях и тревоге - обратись к профессиональному психологу`;
+
+const DISCUSS_TEXT = `💬 Хорошо, давай продолжим.
+
+Задай вопрос по разбору, поделись своими ассоциациями или расскажи, что из ответа резонирует, а что нет. Чем больше обратной связи — тем глубже получится проработка.`;
+
+const CLEAR_TEXT = `🗑 История очищена. Можешь рассказать новый сон.`;
+
+// ===== ОБРАБОТЧИКИ КОМАНД =====
+
+bot.start(async (ctx) => {
+  const userId = ctx.from.id;
+  clearHistory(userId);
+  log('info', 'User started bot', { userId, username: ctx.from.username });
+  await ctx.reply('Меню обновлено 👇', Markup.removeKeyboard());
+  await ctx.reply(START_TEXT, getMenuInline(userId));
+});
+
+bot.command('reset', async (ctx) => {
+  const userId = ctx.from.id;
+  clearHistory(userId);
+  log('info', 'History reset by command', { userId });
+  await ctx.reply(CLEAR_TEXT, getMenuInline(userId));
+});
+
+bot.command('stop', async (ctx) => {
+  if (!ADMIN_ID || ctx.from.id !== ADMIN_ID) {
+    return ctx.reply('Эта команда только для администратора.', getMenuInline(ctx.from.id));
+  }
+  await ctx.reply('Бот останавливается...');
+  log('warn', 'Emergency stop by admin', { adminId: ADMIN_ID });
+  db.close();
+  await bot.stop();
+  process.exit(0);
+});
+
+// ===== INLINE-КНОПКИ =====
+
+bot.action('tell_dream', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply(TELL_DREAM_TEXT, backInline);
+});
+
+bot.action('tell_new_dream', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply(TELL_DREAM_TEXT, backInline);
+});
+
+bot.action('discuss_dream', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply(DISCUSS_TEXT, backInline);
+});
+
+bot.action('clear_history', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from.id;
+  clearHistory(userId);
+  log('info', 'History reset by inline button', { userId });
+  await ctx.reply(CLEAR_TEXT, getMenuInline(userId));
+});
+
+bot.action('about', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply(ABOUT_TEXT, backInline);
+});
+
+bot.action('example', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply(EXAMPLE_TEXT, backInline);
+});
+
+bot.action('back_menu', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply(START_TEXT, getMenuInline(ctx.from.id));
+});
+
+// ===== ОСНОВНОЙ ОБРАБОТЧИК ТЕКСТА =====
+
+bot.on('text', async (ctx) => {
+  const userId = ctx.from.id;
+  const userText = ctx.message.text;
+
+  // Защита от старой Reply Keyboard
+  const legacyAction = LEGACY_BUTTON_TEXT_MAP[userText];
+  if (legacyAction) {
+    log('info', 'Legacy reply-keyboard button intercepted', { userId, legacyAction });
+    await ctx.reply('Обновлённое меню — используй кнопки под сообщением ниже 👇', Markup.removeKeyboard());
+    if (legacyAction === 'tell_dream' || legacyAction === 'tell_new_dream') return ctx.reply(TELL_DREAM_TEXT, backInline);
+    if (legacyAction === 'discuss_dream') return ctx.reply(DISCUSS_TEXT, backInline);
+    if (legacyAction === 'clear_history') {
+      clearHistory(userId);
+      return ctx.reply(CLEAR_TEXT, getMenuInline(userId));
+    }
+    if (legacyAction === 'about') return ctx.reply(ABOUT_TEXT, backInline);
+    if (legacyAction === 'example') return ctx.reply(EXAMPLE_TEXT, backInline);
+  }
+
+  // Rate limit
+  const now = Date.now();
+  const last = rateLimits.get(userId);
+  if (last && now - last < RATE_LIMIT_MS) {
+    const wait = Math.ceil((RATE_LIMIT_MS - (now - last)) / 1000);
+    return ctx.reply(`Слишком быстро. Подожди ${wait} сек.`, getMenuInline(userId));
+  }
+  rateLimits.set(userId, now);
+
+  // Валидация длины
+  if (userText.length > MAX_MESSAGE_LENGTH) {
+    return ctx.reply(
+      `Слишком длинное сообщение. Максимум ${MAX_MESSAGE_LENGTH} символов. Попробуй разбить сон на части или сократить описание.`,
+      getMenuInline(userId)
+    );
+  }
+
+  // Фильтр prompt injection
+  if (FORBIDDEN_PATTERNS.some((p) => p.test(userText))) {
+    log('warn', 'Prompt injection attempt', { userId, text: userText.slice(0, 100) });
+    return ctx.reply(
+      'Давай вернёмся к разбору сна. Если хочешь начать заново — очисти историю.',
+      getMenuInline(userId)
+    );
+  }
+
+  // Определяем: первый сон или обсуждение
+  const isFirstDream = !hasAssistantReplied(userId);
+
+  saveMessage(userId, 'user', userText);
+  log('info', 'Message received', { userId, length: userText.length, isFirstDream });
+
+  // Показываем "печатает..." и отправляем сообщение "думаю"
+  await ctx.sendChatAction('typing');
+  let thinkingMsg;
+  try {
+    const thinkingText = isFirstDream
+      ? '🤔 Думаю над твоим сном...'
+      : '🤔 Думаю над твоими мыслями...';
+    thinkingMsg = await ctx.reply(thinkingText);
+  } catch (e) {
+    log('warn', 'Failed to send thinking message', { userId, error: e.message });
+  }
+
+  try {
+    const history = getHistoryForContext(userId);
+    log('info', 'Sending request to API', { userId, historyLength: history.length });
+
+    const reply = await askKimi(history);
+    if (!reply) throw new Error('Empty reply from API');
+
+    saveMessage(userId, 'assistant', reply);
+    log('info', 'Reply received', { userId, replyLength: reply.length });
+
+    if (thinkingMsg?.message_id) {
+      await ctx.deleteMessage(thinkingMsg.message_id).catch(() => {});
+    }
+    await sendLongMessage(ctx, reply, userId);
+  } catch (error) {
+    const isTimeout = error?.name === 'AbortError';
+    log('error', 'API error', {
+      userId,
+      isTimeout,
+      error: error?.message || String(error),
+    });
+
+    const errorText = '⏱️ Не удалось получить ответ — сервер перегружен или временные ограничения. Попробуй ещё раз через минуту.';
+    if (thinkingMsg?.message_id) {
+      try {
+        await ctx.telegram.editMessageText(ctx.chat.id, thinkingMsg.message_id, undefined, errorText);
+      } catch {
+        await ctx.reply(errorText, getMenuInline(userId));
+      }
+    } else {
+      await ctx.reply(errorText, getMenuInline(userId));
+    }
+  }
+});
+
+// ===== ВЫЗОВ API (AbortController — реально отменяет запрос) =====
+
+async function askKimi(history) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  const startedAt = Date.now();
+
+  try {
+    const res = await fetch(API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${MOONSHOT_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: MODEL_NAME,
+        messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...history],
+        reasoning_effort: 'low',
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+    log('info', 'Kimi API responded', { model: MODEL_NAME, elapsedMs: Date.now() - startedAt, status: res.status });
+
+    // Обработка 429 — ждём 2 сек и пробуем ещё раз
+    if (res.status === 429) {
+      log('warn', 'Got 429, retrying in 2s');
+      await sleep(2000);
+      return askKimi(history); // 1 retry
+    }
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`HTTP ${res.status}: ${errText.slice(0, 200)}`);
+    }
+
+    const data = await res.json();
+    return data.choices?.[0]?.message?.content || null;
+  } catch (err) {
+    clearTimeout(timeout);
+    log('error', 'Kimi API call failed', { model: MODEL_NAME, elapsedMs: Date.now() - startedAt, error: err?.message || String(err) });
+    throw err;
+  }
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
+
+async function sendLongMessage(ctx, text, userId) {
+  const LIMIT = 4000;
+  const menu = getMenuInline(userId);
+  if (text.length <= LIMIT) {
+    return ctx.reply(text, menu);
+  }
+  const parts = [];
+  for (let i = 0; i < text.length; i += LIMIT) {
+    parts.push(text.slice(i, i + LIMIT));
+  }
+  for (let i = 0; i < parts.length; i++) {
+    const isLast = i === parts.length - 1;
+    await ctx.reply(parts[i], isLast ? menu : undefined);
+  }
+}
+
+bot.launch();
+log('info', 'Bot started and listening...');
+
+// Graceful shutdown
+process.once('SIGINT', () => {
+  log('info', 'SIGINT received, shutting down gracefully');
+  db.close();
+  bot.stop('SIGINT');
+});
+
+process.once('SIGTERM', () => {
+  log('info', 'SIGTERM received, shutting down gracefully');
+  db.close();
+  bot.stop('SIGTERM');
+});

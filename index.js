@@ -445,6 +445,24 @@ async function sendLongMessage(ctx, text) {
   }
 }
 
+// ===== ОЧИСТКА СТАРОГО МЕНЮ КОМАНД =====
+// Telegram хранит список команд (setMyCommands) на своей стороне до явной
+// отмены — простое удаление кода, который их регистрировал, ничего не чистит.
+// Раньше бот регистрировал /start, /reset, /about, /example и админ-команды —
+// снимаем их явно, иначе слэш-меню продолжит висеть у всех пользователей.
+async function clearCommandsMenu() {
+  try {
+    await bot.telegram.deleteMyCommands();
+    if (ADMIN_ID) {
+      await bot.telegram.deleteMyCommands({ scope: { type: 'chat', chat_id: ADMIN_ID } });
+    }
+    log('info', 'Cleared legacy slash-commands menu');
+  } catch (e) {
+    log('warn', 'Failed to clear commands menu', { error: e.message });
+  }
+}
+
+await clearCommandsMenu();
 bot.launch();
 log('info', 'Bot started and listening...');
 

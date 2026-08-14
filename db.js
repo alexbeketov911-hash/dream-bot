@@ -1,6 +1,11 @@
 import Database from 'better-sqlite3';
 
-const db = new Database('dream-bot.db');
+// На Railway файловая система эфемерна между деплоями — если подключён
+// persistent volume, путь к нему передаётся через DB_PATH (см. переменные
+// окружения в Railway). Без volume/переменной — как раньше, локальный файл
+// рядом с кодом (для локальной разработки этого достаточно).
+const DB_PATH = process.env.DB_PATH || 'dream-bot.db';
+const db = new Database(DB_PATH);
 
 // WAL быстрее и безопаснее при одновременном чтении/записи
 // Foreign keys включаем явно, иначе SQLite их игнорирует

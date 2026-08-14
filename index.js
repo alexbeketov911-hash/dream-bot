@@ -52,30 +52,22 @@ function hasAssistantReplied(userId) {
   }
 }
 
-// ---- Inline-кнопки: динамически в зависимости от стадии диалога ----
+// ---- Inline-кнопки: только контекстный "следующий шаг", 1-2 кнопки ----
+// Остальные функции (об/пример/очистка) теперь живут в системном меню команд Telegram
 function getMenuInline(userId) {
   try {
     if (hasAssistantReplied(userId)) {
       return Markup.inlineKeyboard([
         [Markup.button.callback('💬 Обсудить сон', 'discuss_dream')],
         [Markup.button.callback('🌙 Рассказать новый сон', 'tell_new_dream')],
-        [Markup.button.callback('🗑 Очистить историю', 'clear_history')],
-        [Markup.button.callback('ℹ️ О боте', 'about')],
-        [Markup.button.callback('📋 Пример сна', 'example')],
       ]);
     }
     return Markup.inlineKeyboard([
       [Markup.button.callback('🌙 Рассказать сон', 'tell_dream')],
-      [Markup.button.callback('🗑 Очистить историю', 'clear_history')],
-      [Markup.button.callback('ℹ️ О боте', 'about')],
-      [Markup.button.callback('📋 Пример сна', 'example')],
     ]);
   } catch (e) {
     log('error', 'getMenuInline failed', { userId, error: e.message });
-    return Markup.inlineKeyboard([
-      [Markup.button.callback('🌙 Рассказать сон', 'tell_dream')],
-      [Markup.button.callback('🗑 Очистить историю', 'clear_history')],
-    ]);
+    return Markup.inlineKeyboard([[Markup.button.callback('🌙 Рассказать сон', 'tell_dream')]]);
   }
 }
 
@@ -192,6 +184,14 @@ bot.command('reset', async (ctx) => {
   await ctx.reply(CLEAR_TEXT, getMenuInline(userId));
 });
 
+bot.command('about', async (ctx) => {
+  await ctx.reply(ABOUT_TEXT, getMenuInline(ctx.from.id));
+});
+
+bot.command('example', async (ctx) => {
+  await ctx.reply(EXAMPLE_TEXT, getMenuInline(ctx.from.id));
+});
+
 bot.command('stop', async (ctx) => {
   if (!ADMIN_ID || ctx.from.id !== ADMIN_ID) {
     return ctx.reply('Эта команда только для администратора.', getMenuInline(ctx.from.id));
@@ -269,12 +269,12 @@ bot.action('clear_history', async (ctx) => {
 
 bot.action('about', async (ctx) => {
   await ctx.answerCbQuery();
-  await ctx.reply(ABOUT_TEXT, backInline);
+  await ctx.reply(ABOUT_TEXT, getMenuInline(ctx.from.id));
 });
 
 bot.action('example', async (ctx) => {
   await ctx.answerCbQuery();
-  await ctx.reply(EXAMPLE_TEXT, backInline);
+  await ctx.reply(EXAMPLE_TEXT, getMenuInline(ctx.from.id));
 });
 
 bot.action('back_menu', async (ctx) => {
@@ -483,6 +483,32 @@ async function sendLongMessage(ctx, text, userId) {
   }
 }
 
+// ===== МЕНЮ КОМАНД TELEGRAM =====
+// Появляется по кнопке "Menu" слева от поля ввода — заменяет собой
+// постоянно висящие в чате кнопки об/примере/очистке истории.
+async function setupCommandsMenu() {
+  const publicCommands = [
+    { command: 'start', description: 'Начать / перезапустить бота' },
+    { command: 'reset', description: 'Очистить историю переписки' },
+    { command: 'about', description: 'О боте и подходе' },
+    { command: 'example', description: 'Пример хорошего описания сна' },
+  ];
+
+  await bot.telegram.setMyCommands(publicCommands);
+
+  if (ADMIN_ID) {
+    await bot.telegram.setMyCommands(
+      [
+        ...publicCommands,
+        { command: 'sessions', description: '[admin] Статистика пользователей' },
+        { command: 'stop', description: '[admin] Экстренная остановка' },
+      ],
+      { scope: { type: 'chat', chat_id: ADMIN_ID } }
+    );
+  }
+}
+
+await setupCommandsMenu();
 bot.launch();
 log('info', 'Bot started and listening...');
 

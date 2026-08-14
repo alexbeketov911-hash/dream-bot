@@ -10,7 +10,8 @@
 
 import Database from 'better-sqlite3';
 
-const db = new Database('dream-bot.db', { readonly: true });
+const DB_PATH = process.env.DB_PATH || 'dream-bot.db';
+const db = new Database(DB_PATH, { readonly: true });
 const targetId = process.argv[2];
 
 if (!targetId) {

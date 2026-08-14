@@ -41,10 +41,12 @@ const FORBIDDEN_PATTERNS = [
   /you are now an astrologer/i,
 ];
 
-// ---- Проверка: уже был разбор или первый сон ----
+// ---- Проверка: уже был разбор или это первый сон ----
 function hasAssistantReplied(userId) {
   try {
-    const row = db.prepare('SELECT COUNT(*) as count FROM messages WHERE telegram_id = ? AND role = ?').get(userId, 'assistant');
+    const row = db
+      .prepare('SELECT COUNT(*) as count FROM messages WHERE telegram_id = ? AND role = ?')
+      .get(userId, 'assistant');
     return row.count > 0;
   } catch (e) {
     log('error', 'hasAssistantReplied failed', { userId, error: e.message });
@@ -52,38 +54,31 @@ function hasAssistantReplied(userId) {
   }
 }
 
-// ---- Inline-кнопки: только контекстный "следующий шаг", 1-2 кнопки ----
-// Остальные функции (об/пример/очистка) теперь живут в системном меню команд Telegram
-function getMenuInline(userId) {
-  try {
-    if (hasAssistantReplied(userId)) {
-      return Markup.inlineKeyboard([
-        [Markup.button.callback('💬 Обсудить сон', 'discuss_dream')],
-        [Markup.button.callback('🌙 Рассказать новый сон', 'tell_new_dream')],
-      ]);
-    }
-    return Markup.inlineKeyboard([
-      [Markup.button.callback('🌙 Рассказать сон', 'tell_dream')],
-    ]);
-  } catch (e) {
-    log('error', 'getMenuInline failed', { userId, error: e.message });
-    return Markup.inlineKeyboard([[Markup.button.callback('🌙 Рассказать сон', 'tell_dream')]]);
-  }
-}
+// ===== НАВИГАЦИЯ =====
+// Reply Keyboard — постоянная сетка 2x2 внизу экрана (кнопка-переключатель
+// рядом с полем ввода). Без слэшей, без системного меню команд — просто
+// подписанные эмодзи-кнопки, всегда доступные и не занимающие место в чате.
+const MAIN_KEYBOARD = Markup.keyboard([
+  ['🌙 Рассказать сон', '🗑 Очистить историю'],
+  ['ℹ️ О боте', '📋 Пример сна'],
+]).resize();
 
-const backInline = Markup.inlineKeyboard([
-  [Markup.button.callback('← Назад в меню', 'back_menu')],
-]);
-
-// Защита от старой Reply Keyboard
-const LEGACY_BUTTON_TEXT_MAP = {
+// Нажатия по Reply Keyboard приходят как обычный текст с тем же лейблом.
+const BUTTON_TEXT_MAP = {
   '🌙 Рассказать сон': 'tell_dream',
   '🗑 Очистить историю': 'clear_history',
   'ℹ️ О боте': 'about',
   '📋 Пример сна': 'example',
-  '💬 Обсудить сон': 'discuss_dream',
-  '🌙 Рассказать новый сон': 'tell_new_dream',
 };
+
+// Inline-кнопки "следующий шаг" — приклеены к сообщению с разбором сна,
+// появляются после первой же интерпретации. Один ряд, две кнопки.
+const AFTER_REPLY_INLINE = Markup.inlineKeyboard([
+  [
+    Markup.button.callback('💬 Обсудить сон', 'discuss_dream'),
+    Markup.button.callback('🌙 Рассказать новый сон', 'tell_new_dream'),
+  ],
+]);
 
 // ---- Telegram-бот ----
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN, {
@@ -96,7 +91,7 @@ bot.catch((err, ctx) => {
     userId: ctx?.from?.id,
   });
   try {
-    ctx.reply('Произошла внутренняя ошибка. Попробуй ещё раз или очисти историю.', getMenuInline(ctx.from?.id));
+    ctx.reply('Произошла внутренняя ошибка. Попробуй ещё раз или очисти историю.');
   } catch {}
 });
 
@@ -168,33 +163,35 @@ const DISCUSS_TEXT = `💬 Хорошо, давай продолжим.
 const CLEAR_TEXT = `🗑 История очищена. Можешь рассказать новый сон.`;
 
 // ===== ОБРАБОТЧИКИ КОМАНД =====
+// Команды (/start, /reset и т.д.) продолжают работать, если их набрать
+// руками, но в системное меню Telegram не выводятся — навигация теперь
+// через Reply Keyboard ниже, без слэшей.
 
 bot.start(async (ctx) => {
   const userId = ctx.from.id;
   clearHistory(userId);
   log('info', 'User started bot', { userId, username: ctx.from.username });
-  await ctx.reply('Меню обновлено 👇', Markup.removeKeyboard());
-  await ctx.reply(START_TEXT, getMenuInline(userId));
+  await ctx.reply(START_TEXT, MAIN_KEYBOARD);
 });
 
 bot.command('reset', async (ctx) => {
   const userId = ctx.from.id;
   clearHistory(userId);
   log('info', 'History reset by command', { userId });
-  await ctx.reply(CLEAR_TEXT, getMenuInline(userId));
+  await ctx.reply(CLEAR_TEXT, MAIN_KEYBOARD);
 });
 
 bot.command('about', async (ctx) => {
-  await ctx.reply(ABOUT_TEXT, getMenuInline(ctx.from.id));
+  await ctx.reply(ABOUT_TEXT);
 });
 
 bot.command('example', async (ctx) => {
-  await ctx.reply(EXAMPLE_TEXT, getMenuInline(ctx.from.id));
+  await ctx.reply(EXAMPLE_TEXT);
 });
 
 bot.command('stop', async (ctx) => {
   if (!ADMIN_ID || ctx.from.id !== ADMIN_ID) {
-    return ctx.reply('Эта команда только для администратора.', getMenuInline(ctx.from.id));
+    return ctx.reply('Эта команда только для администратора.');
   }
   await ctx.reply('Бот останавливается...');
   log('warn', 'Emergency stop by admin', { adminId: ADMIN_ID });
@@ -206,7 +203,7 @@ bot.command('stop', async (ctx) => {
 // ---- /sessions — только для админа ----
 bot.command('sessions', async (ctx) => {
   if (!ADMIN_ID || ctx.from.id !== ADMIN_ID) {
-    return ctx.reply('Эта команда только для администратора.', getMenuInline(ctx.from.id));
+    return ctx.reply('Эта команда только для администратора.');
   }
 
   try {
@@ -219,7 +216,7 @@ bot.command('sessions', async (ctx) => {
     `).all();
 
     if (rows.length === 0) {
-      return ctx.reply('📊 Пока нет пользователей.', getMenuInline(ctx.from.id));
+      return ctx.reply('📊 Пока нет пользователей.');
     }
 
     let text = '📊 Статистика пользователей\n\n';
@@ -233,53 +230,23 @@ bot.command('sessions', async (ctx) => {
       buttons.push([Markup.button.callback(`👤 ${id} (${count})`, `view_session_${id}`)]);
     }
 
-    buttons.push([Markup.button.callback('← Назад в меню', 'back_menu')]);
-
     await ctx.reply(text, Markup.inlineKeyboard(buttons));
   } catch (e) {
     log('error', '/sessions error', { error: e.message });
-    await ctx.reply('Ошибка при получении статистики.', getMenuInline(ctx.from.id));
+    await ctx.reply('Ошибка при получении статистики.');
   }
 });
 
-// ===== INLINE-КНОПКИ =====
+// ===== INLINE-ДЕЙСТВИЯ =====
 
-bot.action('tell_dream', async (ctx) => {
+bot.action('discuss_dream', async (ctx) => {
   await ctx.answerCbQuery();
-  await ctx.reply(TELL_DREAM_TEXT, backInline);
+  await ctx.reply(DISCUSS_TEXT);
 });
 
 bot.action('tell_new_dream', async (ctx) => {
   await ctx.answerCbQuery();
-  await ctx.reply(TELL_DREAM_TEXT, backInline);
-});
-
-bot.action('discuss_dream', async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.reply(DISCUSS_TEXT, backInline);
-});
-
-bot.action('clear_history', async (ctx) => {
-  await ctx.answerCbQuery();
-  const userId = ctx.from.id;
-  clearHistory(userId);
-  log('info', 'History reset by inline button', { userId });
-  await ctx.reply(CLEAR_TEXT, getMenuInline(userId));
-});
-
-bot.action('about', async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.reply(ABOUT_TEXT, getMenuInline(ctx.from.id));
-});
-
-bot.action('example', async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.reply(EXAMPLE_TEXT, getMenuInline(ctx.from.id));
-});
-
-bot.action('back_menu', async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.reply(START_TEXT, getMenuInline(ctx.from.id));
+  await ctx.reply(TELL_DREAM_TEXT);
 });
 
 // ---- Просмотр переписки конкретного пользователя (только админ) ----
@@ -298,7 +265,7 @@ bot.action(/view_session_(\d+)/, async (ctx) => {
     ).all(targetId);
 
     if (messages.length === 0) {
-      return ctx.reply('Сообщений не найдено.', backInline);
+      return ctx.reply('Сообщений не найдено.');
     }
 
     let text = `📋 Переписка с ${targetId}:\n\n`;
@@ -308,10 +275,10 @@ bot.action(/view_session_(\d+)/, async (ctx) => {
       if (text.length > 3500) break; // не превышаем лимит
     }
 
-    await ctx.reply(text.slice(0, 4000), backInline);
+    await ctx.reply(text.slice(0, 4000));
   } catch (e) {
     log('error', 'view_session error', { targetId, error: e.message });
-    await ctx.reply('Ошибка при загрузке переписки.', backInline);
+    await ctx.reply('Ошибка при загрузке переписки.');
   }
 });
 
@@ -321,19 +288,17 @@ bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
   const userText = ctx.message.text;
 
-  // Защита от старой Reply Keyboard
-  const legacyAction = LEGACY_BUTTON_TEXT_MAP[userText];
-  if (legacyAction) {
-    log('info', 'Legacy reply-keyboard button intercepted', { userId, legacyAction });
-    await ctx.reply('Обновлённое меню — используй кнопки под сообщением ниже 👇', Markup.removeKeyboard());
-    if (legacyAction === 'tell_dream' || legacyAction === 'tell_new_dream') return ctx.reply(TELL_DREAM_TEXT, backInline);
-    if (legacyAction === 'discuss_dream') return ctx.reply(DISCUSS_TEXT, backInline);
-    if (legacyAction === 'clear_history') {
+  // Нажатие по кнопке Reply Keyboard — приходит как обычный текст с тем же лейблом
+  const buttonAction = BUTTON_TEXT_MAP[userText];
+  if (buttonAction) {
+    log('info', 'Keyboard button pressed', { userId, buttonAction });
+    if (buttonAction === 'tell_dream') return ctx.reply(TELL_DREAM_TEXT);
+    if (buttonAction === 'clear_history') {
       clearHistory(userId);
-      return ctx.reply(CLEAR_TEXT, getMenuInline(userId));
+      return ctx.reply(CLEAR_TEXT, MAIN_KEYBOARD);
     }
-    if (legacyAction === 'about') return ctx.reply(ABOUT_TEXT, backInline);
-    if (legacyAction === 'example') return ctx.reply(EXAMPLE_TEXT, backInline);
+    if (buttonAction === 'about') return ctx.reply(ABOUT_TEXT);
+    if (buttonAction === 'example') return ctx.reply(EXAMPLE_TEXT);
   }
 
   // Rate limit
@@ -341,25 +306,21 @@ bot.on('text', async (ctx) => {
   const last = rateLimits.get(userId);
   if (last && now - last < RATE_LIMIT_MS) {
     const wait = Math.ceil((RATE_LIMIT_MS - (now - last)) / 1000);
-    return ctx.reply(`Слишком быстро. Подожди ${wait} сек.`, getMenuInline(userId));
+    return ctx.reply(`Слишком быстро. Подожди ${wait} сек.`);
   }
   rateLimits.set(userId, now);
 
   // Валидация длины
   if (userText.length > MAX_MESSAGE_LENGTH) {
     return ctx.reply(
-      `Слишком длинное сообщение. Максимум ${MAX_MESSAGE_LENGTH} символов. Попробуй разбить сон на части или сократить описание.`,
-      getMenuInline(userId)
+      `Слишком длинное сообщение. Максимум ${MAX_MESSAGE_LENGTH} символов. Попробуй разбить сон на части или сократить описание.`
     );
   }
 
   // Фильтр prompt injection
   if (FORBIDDEN_PATTERNS.some((p) => p.test(userText))) {
     log('warn', 'Prompt injection attempt', { userId, text: userText.slice(0, 100) });
-    return ctx.reply(
-      'Давай вернёмся к разбору сна. Если хочешь начать заново — очисти историю.',
-      getMenuInline(userId)
-    );
+    return ctx.reply('Давай вернёмся к разбору сна. Если хочешь начать заново — очисти историю.');
   }
 
   // Определяем: первый сон или обсуждение
@@ -393,7 +354,9 @@ bot.on('text', async (ctx) => {
     if (thinkingMsg?.message_id) {
       await ctx.deleteMessage(thinkingMsg.message_id).catch(() => {});
     }
-    await sendLongMessage(ctx, reply, userId);
+    // Инлайн-кнопки "Обсудить / Новый сон" клеим к разбору начиная с самого
+    // первого ответа — с этого момента у пользователя уже есть что обсуждать.
+    await sendLongMessage(ctx, reply);
   } catch (error) {
     const isTimeout = error?.name === 'AbortError';
     log('error', 'API error', {
@@ -407,10 +370,10 @@ bot.on('text', async (ctx) => {
       try {
         await ctx.telegram.editMessageText(ctx.chat.id, thinkingMsg.message_id, undefined, errorText);
       } catch {
-        await ctx.reply(errorText, getMenuInline(userId));
+        await ctx.reply(errorText);
       }
     } else {
-      await ctx.reply(errorText, getMenuInline(userId));
+      await ctx.reply(errorText);
     }
   }
 });
@@ -467,11 +430,10 @@ function sleep(ms) {
 
 // ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
 
-async function sendLongMessage(ctx, text, userId) {
+async function sendLongMessage(ctx, text) {
   const LIMIT = 4000;
-  const menu = getMenuInline(userId);
   if (text.length <= LIMIT) {
-    return ctx.reply(text, menu);
+    return ctx.reply(text, AFTER_REPLY_INLINE);
   }
   const parts = [];
   for (let i = 0; i < text.length; i += LIMIT) {
@@ -479,36 +441,10 @@ async function sendLongMessage(ctx, text, userId) {
   }
   for (let i = 0; i < parts.length; i++) {
     const isLast = i === parts.length - 1;
-    await ctx.reply(parts[i], isLast ? menu : undefined);
+    await ctx.reply(parts[i], isLast ? AFTER_REPLY_INLINE : undefined);
   }
 }
 
-// ===== МЕНЮ КОМАНД TELEGRAM =====
-// Появляется по кнопке "Menu" слева от поля ввода — заменяет собой
-// постоянно висящие в чате кнопки об/примере/очистке истории.
-async function setupCommandsMenu() {
-  const publicCommands = [
-    { command: 'start', description: 'Начать / перезапустить бота' },
-    { command: 'reset', description: 'Очистить историю переписки' },
-    { command: 'about', description: 'О боте и подходе' },
-    { command: 'example', description: 'Пример хорошего описания сна' },
-  ];
-
-  await bot.telegram.setMyCommands(publicCommands);
-
-  if (ADMIN_ID) {
-    await bot.telegram.setMyCommands(
-      [
-        ...publicCommands,
-        { command: 'sessions', description: '[admin] Статистика пользователей' },
-        { command: 'stop', description: '[admin] Экстренная остановка' },
-      ],
-      { scope: { type: 'chat', chat_id: ADMIN_ID } }
-    );
-  }
-}
-
-await setupCommandsMenu();
 bot.launch();
 log('info', 'Bot started and listening...');
 
